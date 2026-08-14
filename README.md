@@ -1,6 +1,6 @@
 # Ticket Booking - Backend Assessment
 
-Service pemesanan tiket konser untuk technical assessment.
+Service pemesanan tiket konser untuk technical assessment. Dibangun dengan Go + SQLite (embedded, tanpa perlu database server terpisah).
 
 ## Menjalankan
 
@@ -8,4 +8,51 @@ Service pemesanan tiket konser untuk technical assessment.
 go run ./cmd/server
 ```
 
-Server jalan di `:8080` (override dengan env `PORT`).
+Server jalan di `:8080` (override dengan env `PORT`, lokasi database dengan `DB_PATH`, default `data.db`). Saat start, tiket `vip-1` di-seed dengan stok 1 sesuai skenario assessment.
+
+## Scenario 1 - Race Condition
+
+**Masalah.** Alur lama: baca stok -> cek di aplikasi -> kurangi stok -> simpan transaksi. Antara "baca" dan "kurangi" ada jeda waktu. Dua request yang datang hampir bersamaan sama-sama membaca stok `1`, sama-sama lolos pengecekan, dan sama-sama jadi membeli - 1 tiket terjual 2 kali.
+
+**Solusi.** Pengecekan dan pengurangan stok dipindah ke database sebagai satu statement atomik, dibungkus satu transaksi bersama insert pembelian:
+
+```sql
+UPDATE tickets SET stock = stock - 1 WHERE id = ? AND stock > 0
+-- rows affected = 1 -> INSERT purchases, COMMIT -> 201
+-- rows affected = 0 -> tiket habis, ROLLBACK -> 409
+```
+
+Database mengeksekusi UPDATE pada baris yang sama secara serial, jadi hanya satu request yang menemukan `stock > 0` bernilai benar. Request yang kalah tidak "lolos cek lalu gagal tulis" - cek dan tulisnya memang satu operasi.
+
+**Asumsi.** Satu instance aplikasi dan SQLite cukup untuk skala assessment. Pola conditional update ini identik perilakunya di PostgreSQL/MySQL, jadi solusinya tidak terikat SQLite.
+
+**Trade-off.** Penulisan ke baris tiket yang sama otomatis terserialisasi - aman, tapi jadi titik antrian kalau satu tiket diserbu ekstrem (puluhan ribu req/detik ke baris yang sama). Di skala itu alternatifnya reservation queue atau stok terpartisi, dengan kompleksitas jauh lebih tinggi.
+
+```mermaid
+flowchart TD
+    A[POST /purchase] --> B[BEGIN transaksi]
+    B --> C{"UPDATE tickets SET stock = stock - 1
+    WHERE id = ? AND stock > 0"}
+    C -->|rows affected = 1| D[INSERT purchases]
+    D --> E[COMMIT]
+    E --> F[201 Created]
+    C -->|rows affected = 0| G[ROLLBACK]
+    G --> H[409 Conflict - tiket habis]
+```
+
+**Demo.** Dua pembeli berebut 1 tiket VIP terakhir - satu dapat `201`, satunya `409`:
+
+```
+curl -s -X POST localhost:8080/purchase -d '{"ticket_id":"vip-1","user_id":"andi","amount":500}' &
+curl -s -X POST localhost:8080/purchase -d '{"ticket_id":"vip-1","user_id":"budi","amount":500}' &
+wait
+curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
+```
+
+## Testing
+
+```
+go test -race ./...
+```
+
+`TestBuy_SatuTiketBanyakPembeli` menembakkan 100 pembeli serentak ke 1 tiket tersisa dan memastikan tepat satu yang berhasil, sisanya `409`, stok akhir 0, dan hanya 1 baris purchase tersimpan.
