@@ -1,19 +1,21 @@
 # Ticket Booking - Backend Assessment
 
-Service pemesanan tiket konser untuk technical assessment. Dibangun dengan Go + SQLite (embedded, tanpa perlu database server terpisah).
+Service pemesanan tiket konser untuk technical assessment. Dibangun dengan Go + PostgreSQL, dijalankan lewat Docker Compose.
 
 ## Menjalankan
 
 ```
-go run ./cmd/server
+docker compose up --build
 ```
 
-Aplikasi menjalankan dua listener:
+Compose menyalakan PostgreSQL lalu aplikasi (menunggu database sehat dulu). Aplikasi menjalankan dua listener:
 
-- `:8080` - API utama (env `PORT`)
-- `:9090` - mock accounting pihak ketiga (env `MOCK_PORT`), sengaja membalas `500` dua kali pertama per kiriman untuk mendemonstrasikan retry Scenario 3 (atur lewat `MOCK_FAIL_FIRST`)
+- `:8080` - API utama
+- `:9090` - mock accounting pihak ketiga, sengaja membalas `500` dua kali pertama per kiriman untuk mendemonstrasikan retry Scenario 3 (atur lewat `MOCK_FAIL_FIRST`)
 
-Env lain: `DB_PATH` (default `data.db`), `ACCOUNTING_URL` (default menunjuk ke mock). Saat start, tiket `vip-1` di-seed dengan stok 1 sesuai skenario assessment.
+Kalau port default bentrok di mesinmu, override lewat env host: `PORT=8096 MOCK_PORT=9096 DB_PORT=5434 docker compose up`.
+
+Bisa juga jalan tanpa container untuk development: `docker compose up -d db` lalu `go run ./cmd/server` (koneksi diatur env `DATABASE_URL`, default menunjuk `localhost:5432`). Env lain: `ACCOUNTING_URL` (default menunjuk ke mock). Saat start, tiket `vip-1` di-seed dengan stok 1 sesuai skenario assessment.
 
 ## Scenario 1 - Race Condition
 
@@ -29,7 +31,7 @@ UPDATE tickets SET stock = stock - 1 WHERE id = ? AND stock > 0
 
 Database mengeksekusi UPDATE pada baris yang sama secara serial, jadi hanya satu request yang menemukan `stock > 0` bernilai benar. Request yang kalah tidak "lolos cek lalu gagal tulis", karena cek dan tulisnya memang satu operasi.
 
-**Asumsi.** Satu instance aplikasi dan SQLite cukup untuk skala assessment. Pola conditional update ini identik perilakunya di PostgreSQL/MySQL, jadi solusinya tidak terikat SQLite.
+**Asumsi.** Satu instance aplikasi cukup untuk skala assessment. Pola conditional update ini SQL standar; perilakunya sama di MySQL atau database relasional lain, jadi solusinya tidak terikat PostgreSQL.
 
 **Trade-off.** Penulisan ke baris tiket yang sama otomatis terserialisasi. Aman, tapi jadi titik antrian kalau satu tiket diserbu ekstrem (puluhan ribu req/detik ke baris yang sama). Di skala itu alternatifnya reservation queue atau stok terpartisi, dengan kompleksitas jauh lebih tinggi.
 
@@ -67,7 +69,7 @@ curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
 - Antrian penuh -> `Submit` menunggu (backpressure), bukan menerima-lalu-hilang.
 - Saat shutdown (SIGTERM), server berhenti menerima request baru lalu menguras sisa antrian sampai habis sebelum keluar.
 
-Hasil di mesin uji: 10.000 transaksi persisten dalam ~1,4 detik alias ~7.000 tx/detik (sebelum tiap transaksi ikut menulis baris outbox Scenario 3, ~18.000 tx/detik). Kebutuhan soal hanya ~167 tx/detik.
+Hasil di mesin uji (postgres dalam docker): 10.000 transaksi persisten dalam ~2,6 detik alias ~3.900 tx/detik. Kebutuhan soal hanya ~167 tx/detik.
 
 **Asumsi.** "Sukses" didefinisikan dari sudut pandang client: transaksi disebut sukses hanya kalau sudah menerima `201`, dan `201` hanya keluar setelah data persisten. Client yang tidak menerima jawaban (timeout/putus) wajib menganggap statusnya tidak pasti dan boleh mengirim ulang.
 
@@ -241,7 +243,7 @@ flowchart LR
         version guard"]
     end
 
-    DB[("SQLite
+    DB[("PostgreSQL
     tickets, purchases, transactions,
     outbox, transaction_payment,
     ticket_availability")]
@@ -273,9 +275,14 @@ Script menembakkan kelima skenario berurutan via curl (port custom: `BASE=localh
 
 ## Testing
 
+Test jalan melawan postgres sungguhan (bukan mock), jadi nyalakan database-nya dulu:
+
 ```
+docker compose up -d db
 go test -race ./...
 ```
+
+Tiap test membuat schema sekali pakai dan membuangnya saat selesai, jadi test antar package aman jalan paralel. Postgres di lokasi lain bisa dioverride lewat `TEST_DATABASE_URL`.
 
 Test kunci per skenario:
 
