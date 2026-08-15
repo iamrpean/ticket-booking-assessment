@@ -49,10 +49,54 @@ wait
 curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
 ```
 
+## Scenario 2 - High Traffic Processing
+
+**Masalah.** Lebih dari 10.000 transaksi masuk dalam waktu kurang dari 1 menit, dan setiap transaksi yang dijawab sukses harus benar-benar tersimpan - tidak boleh ada yang hilang diam-diam.
+
+**Analisis.** Dua jebakan umum di sini: (1) commit database per request - tiap commit memaksa fsync, jadi throughput mentok jauh di bawah kebutuhan; (2) solusi naifnya, "lempar ke antrian lalu langsung balas sukses" - throughput naik tapi janji sukses diberikan *sebelum* data aman, persis sumber transaksi hilang saat proses mati.
+
+**Solusi.** Antrian bounded + satu worker yang menulis secara batch, dengan aturan ketat: **response sukses baru dikirim setelah batch berisi transaksi itu ter-commit**.
+
+- Handler memasukkan transaksi ke antrian lalu *menunggu* hasil commit-nya.
+- Worker mengumpulkan sampai 200 transaksi atau 20ms (mana yang lebih dulu), menulis semuanya dalam satu transaksi DB, lalu membangunkan semua yang menunggu. Ratusan insert menumpang satu fsync.
+- Antrian penuh -> `Submit` menunggu (backpressure), bukan menerima-lalu-hilang.
+- Saat shutdown (SIGTERM), server berhenti menerima request baru lalu menguras sisa antrian sampai habis sebelum keluar.
+
+Hasil di mesin uji: 10.000 transaksi persisten dalam ~0,5 detik (~18.000 tx/detik) - kebutuhan soal hanya ~167 tx/detik.
+
+**Asumsi.** "Sukses" didefinisikan dari sudut pandang client: transaksi disebut sukses hanya kalau sudah menerima `201`, dan `201` hanya keluar setelah data persisten. Client yang tidak menerima jawaban (timeout/putus) wajib menganggap statusnya tidak pasti dan boleh mengirim ulang.
+
+**Trade-off.** Latency per request naik sebesar jendela flush (<=20ms) - harga yang wajar untuk jaminan durability. Satu baris rusak menggagalkan seluruh batch-nya (semua waiter diberi error, tidak ada yang dibohongi "sukses"). Antrian in-memory hilang kalau proses crash, tapi karena ack-setelah-persist, yang hilang hanyalah request yang memang belum dijawab sukses - client tahu dan bisa retry. Di skala multi-node, antrian ini digantikan message broker durable (Kafka/RabbitMQ) dengan prinsip yang sama: ack setelah persisten.
+
+```mermaid
+flowchart TD
+    A["POST /transactions (banyak client)"] --> B[Handler: enqueue + tunggu hasil]
+    B --> Q[("Antrian bounded
+    penuh -> backpressure")]
+    Q --> W[Worker tunggal]
+    W --> X{"batch 200 item
+    atau lewat 20ms?"}
+    X --> T["BEGIN -> INSERT xN -> COMMIT
+    (satu fsync untuk satu batch)"]
+    T -->|commit sukses| Y[Bangunkan waiter -> 201]
+    T -->|commit gagal| Z[Bangunkan waiter -> 500]
+```
+
+**Demo.**
+
+```
+curl -s -X POST localhost:8080/transactions -d '{"ticket_id":"vip-1","user_id":"cici","amount":100}'
+# -> {"id":"tx-...","status":"stored"}   <- dikirim SETELAH data ter-commit
+```
+
 ## Testing
 
 ```
 go test -race ./...
 ```
 
-`TestBuy_SatuTiketBanyakPembeli` menembakkan 100 pembeli serentak ke 1 tiket tersisa dan memastikan tepat satu yang berhasil, sisanya `409`, stok akhir 0, dan hanya 1 baris purchase tersimpan.
+Test kunci per skenario:
+
+- `TestBuy_SatuTiketBanyakPembeli` (S1) - 100 pembeli serentak ke 1 tiket tersisa: tepat satu berhasil, sisanya `409`, stok akhir 0, hanya 1 baris purchase.
+- `TestSubmit_10RibuSemuaTersimpan` (S2) - 10.000 submit serentak: semua dijawab sukses dan semuanya terhitung di database.
+- `TestSubmit_BatchGagalSemuaDapatError` (S2) - kalau satu batch gagal commit, semua request di batch itu dapat error, tidak ada yang dijawab sukses palsu.
