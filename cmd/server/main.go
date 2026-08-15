@@ -1,14 +1,18 @@
 package main
 
 import (
-	"database/sql"
-	"encoding/json"
+	"context"
 	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	"github.com/iamrpean/ticket-booking-assessment/internal/api"
 	"github.com/iamrpean/ticket-booking-assessment/internal/booking"
+	"github.com/iamrpean/ticket-booking-assessment/internal/ingest"
 	"github.com/iamrpean/ticket-booking-assessment/internal/store"
 )
 
@@ -34,75 +38,32 @@ func main() {
 	}
 
 	bookingSvc := &booking.Service{DB: db}
+	ingestSvc := ingest.New(db, 4096, 200, 20*time.Millisecond)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("POST /purchase", handlePurchase(bookingSvc))
-	mux.HandleFunc("GET /tickets/{id}", handleGetTicket(db))
-
-	log.Printf("server listen di :%s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr: ":" + port,
+		Handler: api.New(api.Deps{
+			DB:      db,
+			Booking: bookingSvc,
+			Ingest:  ingestSvc,
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
-}
 
-type purchaseReq struct {
-	TicketID string `json:"ticket_id"`
-	UserID   string `json:"user_id"`
-	Amount   int64  `json:"amount"`
-}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-func handlePurchase(svc *booking.Service) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req purchaseReq
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body bukan json valid"})
-			return
+	go func() {
+		log.Printf("server listen di :%s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
 		}
-		if req.TicketID == "" || req.UserID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ticket_id dan user_id wajib diisi"})
-			return
-		}
+	}()
 
-		p, err := svc.Buy(r.Context(), req.TicketID, req.UserID, req.Amount)
-		switch {
-		case errors.Is(err, booking.ErrSoldOut):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "tiket habis"})
-		case errors.Is(err, booking.ErrNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "tiket tidak ditemukan"})
-		case err != nil:
-			log.Printf("purchase: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-		default:
-			writeJSON(w, http.StatusCreated, p)
-		}
-	}
-}
-
-func handleGetTicket(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		var name string
-		var stock int
-		err := db.QueryRow(`SELECT name, stock FROM tickets WHERE id = ?`, id).Scan(&name, &stock)
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "tiket tidak ditemukan"})
-			return
-		}
-		if err != nil {
-			log.Printf("get ticket: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"id": id, "name": name, "stock": stock})
-	}
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	<-ctx.Done()
+	log.Println("shutdown: menyelesaikan request aktif lalu menguras antrian ingest")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+	ingestSvc.Close() // setelah server berhenti terima request, kuras sisa antrian
 }
