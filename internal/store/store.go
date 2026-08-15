@@ -46,6 +46,18 @@ CREATE TABLE IF NOT EXISTS outbox (
 	sent_at       DATETIME
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_retry_at);
+
+-- Payment dari webhook pihak ketiga. UNIQUE(payment_id) adalah kunci
+-- idempotensi: request duplikat tidak akan pernah jadi dua baris,
+-- seberapa pun bersamaan datangnya.
+CREATE TABLE IF NOT EXISTS transaction_payment (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	payment_id     TEXT NOT NULL UNIQUE,
+	transaction_id TEXT NOT NULL,
+	amount         INTEGER NOT NULL,
+	payload        TEXT NOT NULL,
+	created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 // Open membuka database sqlite dan menjalankan migrasi skema.
