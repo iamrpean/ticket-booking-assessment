@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -131,8 +132,29 @@ func (s *Service) insertBatch(batch []item) error {
 	}
 	defer stmt.Close()
 
+	// outbox ikut ditulis di transaksi batch yang sama (Scenario 3):
+	// transaksi tersimpan dan jadwal kirim ke accounting-nya atomik.
+	obStmt, err := tx.Prepare(
+		`INSERT INTO outbox (kind, ref_id, payload) VALUES ('transaction', ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer obStmt.Close()
+
+	now := time.Now().UTC().Format(time.RFC3339)
 	for _, it := range batch {
 		if _, err := stmt.Exec(it.tx.ID, it.tx.TicketID, it.tx.UserID, it.tx.Amount); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"type":           "transaction",
+			"transaction_id": it.tx.ID,
+			"ticket_id":      it.tx.TicketID,
+			"user_id":        it.tx.UserID,
+			"amount":         it.tx.Amount,
+			"occurred_at":    now,
+		})
+		if _, err := obStmt.Exec(it.tx.ID, string(payload)); err != nil {
 			return err
 		}
 	}
