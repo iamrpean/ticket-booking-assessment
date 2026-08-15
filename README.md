@@ -138,6 +138,44 @@ sleep 4 && curl -s localhost:8080/outbox/stats   # {"SENT":1}
 curl -s localhost:9090/stats            # {"received":1} - diterima tepat sekali
 ```
 
+## Scenario 4 - Duplicate Request
+
+**Masalah.** Pihak ketiga memproses transaksi di background lalu mengirim webhook berisi data payment untuk disimpan ke `transaction_payment`. Karena respon kita tidak sampai ke mereka (masalah jaringan), mereka retry - dan karena anomali, dua request dengan data identik bisa datang **di waktu yang sama**. Tanpa penanganan, satu payment tercatat dua kali.
+
+**Analisis.** Ini race condition Scenario 1 dalam wujud lain. Dedup yang dicek di aplikasi ("SELECT dulu, kalau belum ada baru INSERT") punya celah waktu yang sama: dua request bersamaan sama-sama tidak menemukan baris, lalu sama-sama insert. Pengecekannya harus atomik.
+
+**Solusi.** Keunikan ditegakkan di database - `UNIQUE(payment_id)` + `ON CONFLICT DO NOTHING`:
+
+- Request pertama (siapa pun pemenangnya) -> baris tersimpan -> `200 {"status":"stored"}`.
+- Request duplikat, sesimultan apa pun -> diserap constraint -> `200 {"duplicate":true}`.
+- Duplikat **tetap dibalas 200**, bukan error - konsumer idempoten yang membalas error untuk duplikat justru membuat pihak ketiga retry tanpa henti. 200 artinya "data ini sudah aman di saya", dan itu benar.
+
+Ini pasangan simetris dari Scenario 3: saat mengirim, kita menyertakan `X-Idempotency-Key` supaya pihak ketiga bisa dedup; saat menerima, kita melakukan dedup yang sama memakai `payment_id` mereka.
+
+**Asumsi.** `payment_id` dari pihak ketiga stabil antar retry (itulah kontrak idempotency key). Kalau pihak ketiga tidak menyediakannya, gantinya hash deterministik dari konten payload. Payload mentah ikut disimpan untuk audit.
+
+**Trade-off.** Satu unique index - biaya kecil. Perlu disepakati juga masa simpan key-nya; di sini permanen (ukuran data assessment), di produksi biasanya cukup selama jendela retry pihak ketiga.
+
+```mermaid
+flowchart TD
+    A[Webhook payment tiba] --> B["INSERT INTO transaction_payment
+    ON CONFLICT(payment_id) DO NOTHING"]
+    B -->|rows affected = 1| C["baris baru tersimpan
+    200 stored"]
+    B -->|rows affected = 0| D["duplikat diserap
+    200 ok, duplicate:true"]
+    C --> E[Pihak ketiga berhenti retry]
+    D --> E
+```
+
+**Demo.** Kirim webhook identik dua kali (boleh paralel):
+
+```
+BODY='{"payment_id":"pay_9","transaction_id":"tx-1","amount":500}'
+curl -s -X POST localhost:8080/webhook/payment -d "$BODY"   # {"status":"stored"}
+curl -s -X POST localhost:8080/webhook/payment -d "$BODY"   # {"duplicate":true,"status":"ok"}
+```
+
 ## Testing
 
 ```
@@ -152,3 +190,4 @@ Test kunci per skenario:
 - `TestDispatcher_Retry500SampaiTerkirim` (S3) - pihak ketiga membalas 500 dua kali lalu pulih: retry jalan, berakhir `SENT`, diterima tepat sekali.
 - `TestDispatcher_DeadLetterSetelahMaxAttempts` (S3) - pihak ketiga mati total: berhenti di `DEAD` setelah batas percobaan, tidak retry selamanya.
 - `TestBuy_MencatatOutbox` / `TestSubmit_MencatatOutbox` (S3) - baris outbox lahir di transaksi DB yang sama; pembelian gagal tidak meninggalkan outbox.
+- `TestStore_DuplikatSerentakSatuBaris` (S4) - 50 webhook identik serentak: semua dijawab sukses, tepat 1 baris tersimpan.
