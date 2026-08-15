@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS transaction_payment (
 	payload        TEXT NOT NULL,
 	created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Ketersediaan tiket versi sistem tujuan (sisi penerima sinkronisasi).
+-- version monoton naik dipakai menolak update yang datang terlambat.
+CREATE TABLE IF NOT EXISTS ticket_availability (
+	ticket_id  TEXT PRIMARY KEY,
+	quantity   INTEGER NOT NULL,
+	version    INTEGER NOT NULL,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 // Open membuka database sqlite dan menjalankan migrasi skema.
