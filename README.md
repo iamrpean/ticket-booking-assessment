@@ -176,6 +176,101 @@ curl -s -X POST localhost:8080/webhook/payment -d "$BODY"   # {"status":"stored"
 curl -s -X POST localhost:8080/webhook/payment -d "$BODY"   # {"duplicate":true,"status":"ok"}
 ```
 
+## Scenario 5 - Data Synchronization
+
+**Masalah.** Sistem tiket mengirim update ketersediaan ke sistem lain: update pertama `quantity=5`, update kedua `quantity=2`. Karena latency jaringan, update kedua tiba lebih dulu - lalu update pertama yang telat menimpanya. Sistem tujuan menampilkan 5, padahal kondisi sebenarnya 2. Akar masalahnya: *last-write-wins berdasarkan waktu kedatangan*, padahal jaringan tidak pernah menjanjikan urutan kedatangan.
+
+**Solusi.** Urutan tidak boleh disimpulkan dari kedatangan - ia harus dibawa oleh datanya sendiri. Setiap update membawa `version` yang monoton naik dari sistem sumber, dan penerima hanya menerapkan update yang version-nya **lebih besar** dari yang tersimpan:
+
+```sql
+INSERT INTO ticket_availability (ticket_id, quantity, version) VALUES (?, ?, ?)
+ON CONFLICT(ticket_id) DO UPDATE SET quantity = excluded.quantity, version = excluded.version
+WHERE excluded.version > ticket_availability.version
+```
+
+Guard-nya berada **di dalam** statement upsert - bukan "SELECT version dulu, bandingkan di aplikasi, baru tulis", yang punya celah waktu yang sama dengan Scenario 1. Update basi dijawab `200 {"applied":false,"reason":"stale version"}`: tetap di-ack supaya pengirim tidak retry, tapi datanya diabaikan.
+
+**Asumsi.** Sumber sanggup menerbitkan version monoton per tiket (counter yang di-increment atomik di database sumber). Alternatif version: timestamp sumber (rentan clock skew antar mesin) atau sequence dari message broker.
+
+**Trade-off.** Update dikirim *full-state* (nilai quantity utuh), bukan delta - kalau ada update yang hilang di tengah, update terbaru tetap self-contained dan hasil akhirnya benar; delta menuntut urutan sempurna tanpa lubang, jauh lebih rapuh. Harganya: semua pengirim harus disiplin lewat kontrak version - satu pengirim yang menulis tanpa version merusak jaminannya.
+
+```mermaid
+flowchart TD
+    A["Update tiba (ticket_id, quantity, version)"] --> B["Upsert dengan guard:
+    WHERE excluded.version > tersimpan"]
+    B -->|"version lebih baru
+    rows affected = 1"| C["Data diperbarui
+    200 applied:true"]
+    B -->|"version lama / sama
+    rows affected = 0"| D["Update basi diabaikan
+    200 applied:false (stale)"]
+```
+
+**Demo.** Update v2 tiba duluan, v1 telat:
+
+```
+curl -s -X POST localhost:8080/sync/availability -d '{"ticket_id":"vip-1","quantity":2,"version":2}'   # applied:true
+curl -s -X POST localhost:8080/sync/availability -d '{"ticket_id":"vip-1","quantity":5,"version":1}'   # applied:false, stale
+curl -s localhost:8080/sync/availability/vip-1    # quantity=2, version=2
+```
+
+## Diagram flow gabungan
+
+Kelima skenario dalam satu kesatuan - satu aplikasi, satu database, dua arah integrasi dengan dunia luar:
+
+```mermaid
+flowchart LR
+    subgraph Luar["Dunia luar"]
+        B[Pembeli]
+        T[Client transaksi massal]
+        A["Accounting pihak ketiga
+        (bisa 500 / retry / duplikat)"]
+        S[Sistem sumber availability]
+    end
+
+    subgraph App["Ticket booking service"]
+        P["S1 POST /purchase
+        cek+kurangi stok atomik"]
+        I["S2 POST /transactions
+        antrian -> batch commit -> ack"]
+        D["S3 outbox dispatcher
+        retry backoff + dead letter"]
+        W["S4 POST /webhook/payment
+        dedup unique constraint"]
+        V["S5 POST /sync/availability
+        version guard"]
+    end
+
+    DB[("SQLite
+    tickets * purchases * transactions
+    outbox * transaction_payment
+    ticket_availability")]
+
+    B --> P
+    T --> I
+    P -->|"+ baris outbox (satu tx)"| DB
+    I -->|"+ baris outbox (satu tx)"| DB
+    DB -->|poll PENDING| D
+    D -->|"POST /transaction
+    X-Idempotency-Key"| A
+    A -->|webhook payment| W
+    W --> DB
+    S -->|update quantity+version| V
+    V --> DB
+```
+
+Benang merah desainnya dua hal. Pertama, **keputusan kritis dieksekusi sebagai satu operasi atomik di database** - cek-dan-kurangi stok (S1), simpan-dan-jadwalkan-kirim (S3), tolak-duplikat (S4), tolak-basi (S5) - karena pengecekan di level aplikasi selalu menyisakan celah waktu di antara baca dan tulis. Kedua, **jaringan dianggap selalu bisa gagal di titik mana pun**: sukses baru diakui setelah data persisten (S2), kiriman keluar dicatat dulu lalu di-retry sampai sampai (S3), dan pesan masuk yang dobel atau telat dikenali lalu diserap tanpa merusak data (S4, S5).
+
+## Menjalankan demo semua skenario
+
+Dengan server berjalan, di terminal lain:
+
+```
+./scripts/demo.sh
+```
+
+Script menembakkan kelima skenario berurutan via curl (port custom: `BASE=localhost:8095 MOCK=localhost:9095 ./scripts/demo.sh`).
+
 ## Testing
 
 ```
@@ -191,3 +286,5 @@ Test kunci per skenario:
 - `TestDispatcher_DeadLetterSetelahMaxAttempts` (S3) - pihak ketiga mati total: berhenti di `DEAD` setelah batas percobaan, tidak retry selamanya.
 - `TestBuy_MencatatOutbox` / `TestSubmit_MencatatOutbox` (S3) - baris outbox lahir di transaksi DB yang sama; pembelian gagal tidak meninggalkan outbox.
 - `TestStore_DuplikatSerentakSatuBaris` (S4) - 50 webhook identik serentak: semua dijawab sukses, tepat 1 baris tersimpan.
+- `TestApply_UpdateTerbalik` (S5) - v2 tiba duluan, v1 telat: yang basi ditolak, hasil akhir qty=2.
+- `TestApply_KonkurenVersiTertinggiMenang` (S5) - 30 versi datang serentak dalam urutan acak: version tertinggi selalu menang.
