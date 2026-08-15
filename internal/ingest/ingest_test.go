@@ -3,22 +3,16 @@ package ingest
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/iamrpean/ticket-booking-assessment/internal/store"
+	"github.com/iamrpean/ticket-booking-assessment/internal/testdb"
 )
 
 func openDB(t *testing.T) *Service {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	svc := New(db, 4096, 200, 20*time.Millisecond)
+	svc := New(testdb.New(t), 4096, 200, 20*time.Millisecond)
 	t.Cleanup(svc.Close)
 	return svc
 }
@@ -35,7 +29,7 @@ func TestSubmit_TersimpanDenganIDOtomatis(t *testing.T) {
 	}
 
 	var n int
-	if err := svc.db.QueryRow(`SELECT COUNT(1) FROM transactions WHERE id = ?`, id).Scan(&n); err != nil {
+	if err := svc.db.QueryRow(`SELECT COUNT(1) FROM transactions WHERE id = $1`, id).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
@@ -112,11 +106,7 @@ func TestSubmit_10RibuSemuaTersimpan(t *testing.T) {
 // seluruh batch gagal dan SEMUA waiter di batch itu diberi tahu - tidak ada
 // yang dijawab sukses padahal tidak tersimpan.
 func TestSubmit_BatchGagalSemuaDapatError(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := testdb.New(t)
 	// batch kecil + flush lama supaya dua submit di bawah pasti sebatch
 	svc := New(db, 16, 2, time.Second)
 	t.Cleanup(svc.Close)

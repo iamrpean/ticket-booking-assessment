@@ -34,8 +34,8 @@ func (s *Service) Store(ctx context.Context, p Payment, raw []byte) (bool, error
 	}
 	res, err := s.DB.ExecContext(ctx, `
 		INSERT INTO transaction_payment (payment_id, transaction_id, amount, payload)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(payment_id) DO NOTHING`,
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (payment_id) DO NOTHING`,
 		p.PaymentID, p.TransactionID, p.Amount, string(raw))
 	if err != nil {
 		return false, err

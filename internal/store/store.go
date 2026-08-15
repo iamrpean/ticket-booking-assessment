@@ -1,10 +1,12 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const schema = `
@@ -15,35 +17,35 @@ CREATE TABLE IF NOT EXISTS tickets (
 );
 
 CREATE TABLE IF NOT EXISTS purchases (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	id         BIGSERIAL PRIMARY KEY,
 	ticket_id  TEXT NOT NULL REFERENCES tickets(id),
 	user_id    TEXT NOT NULL,
-	amount     INTEGER NOT NULL,
-	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	amount     BIGINT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
 	id         TEXT PRIMARY KEY,
 	ticket_id  TEXT NOT NULL,
 	user_id    TEXT NOT NULL,
-	amount     INTEGER NOT NULL,
-	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	amount     BIGINT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Outbox: baris dibuat dalam transaksi DB yang SAMA dengan penulisan
 -- transaksinya, lalu dikirim ke pihak ketiga oleh dispatcher terpisah.
 -- next_retry_at berupa unix milli supaya perhitungan backoff ada di Go.
 CREATE TABLE IF NOT EXISTS outbox (
-	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	id            BIGSERIAL PRIMARY KEY,
 	kind          TEXT NOT NULL,             -- 'purchase' | 'transaction'
 	ref_id        TEXT NOT NULL,
 	payload       TEXT NOT NULL,
 	status        TEXT NOT NULL DEFAULT 'PENDING', -- PENDING | SENT | DEAD
 	attempts      INTEGER NOT NULL DEFAULT 0,
-	next_retry_at INTEGER NOT NULL DEFAULT 0,
+	next_retry_at BIGINT NOT NULL DEFAULT 0,
 	last_error    TEXT,
-	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	sent_at       DATETIME
+	created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+	sent_at       TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_retry_at);
 
@@ -51,33 +53,53 @@ CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_retry_at);
 -- idempotensi: request duplikat tidak akan pernah jadi dua baris,
 -- seberapa pun bersamaan datangnya.
 CREATE TABLE IF NOT EXISTS transaction_payment (
-	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	id             BIGSERIAL PRIMARY KEY,
 	payment_id     TEXT NOT NULL UNIQUE,
 	transaction_id TEXT NOT NULL,
-	amount         INTEGER NOT NULL,
+	amount         BIGINT NOT NULL,
 	payload        TEXT NOT NULL,
-	created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Ketersediaan tiket versi sistem tujuan (sisi penerima sinkronisasi).
 -- version monoton naik dipakai menolak update yang datang terlambat.
 CREATE TABLE IF NOT EXISTS ticket_availability (
 	ticket_id  TEXT PRIMARY KEY,
-	quantity   INTEGER NOT NULL,
-	version    INTEGER NOT NULL,
-	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	quantity   BIGINT NOT NULL,
+	version    BIGINT NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 `
 
-// Open membuka database sqlite dan menjalankan migrasi skema.
-func Open(path string) (*sql.DB, error) {
-	// synchronous=NORMAL aman dikombinasikan dengan WAL dan memangkas fsync
-	// per commit - penting saat volume tulis tinggi.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)", path)
-	db, err := sql.Open("sqlite", dsn)
+// Open membuka koneksi postgres dan menjalankan migrasi skema. Ping
+// di-retry sebentar supaya app tidak mati cuma karena database masih
+// dalam proses start (urutan container).
+func Open(databaseURL string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
+
+	// Postgres membatasi jumlah koneksi (default 100). Pool dibatasi supaya
+	// lonjakan goroutine mengantre di pool, bukan menjebol max_connections.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxIdleTime(time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for {
+		if err = db.PingContext(ctx); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			db.Close()
+			return nil, fmt.Errorf("database tidak bisa dihubungi: %w", err)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrasi skema: %w", err)
@@ -87,7 +109,7 @@ func Open(path string) (*sql.DB, error) {
 
 // SeedTicket membuat tiket kalau belum ada, dipakai untuk demo & test.
 func SeedTicket(db *sql.DB, id, name string, stock int) error {
-	_, err := db.Exec(`INSERT INTO tickets (id, name, stock) VALUES (?, ?, ?)
-		ON CONFLICT(id) DO NOTHING`, id, name, stock)
+	_, err := db.Exec(`INSERT INTO tickets (id, name, stock) VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO NOTHING`, id, name, stock)
 	return err
 }

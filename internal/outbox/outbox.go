@@ -45,7 +45,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 func (d *Dispatcher) processDue(ctx context.Context) {
 	rows, err := d.DB.QueryContext(ctx, `
 		SELECT id, payload, attempts FROM outbox
-		WHERE status = 'PENDING' AND next_retry_at <= ?
+		WHERE status = 'PENDING' AND next_retry_at <= $1
 		ORDER BY id LIMIT 50`, time.Now().UnixMilli())
 	if err != nil {
 		log.Printf("outbox: query due: %v", err)
@@ -101,7 +101,7 @@ func (d *Dispatcher) send(ctx context.Context, id int64, payload string) error {
 
 func (d *Dispatcher) recordSent(id int64) {
 	if _, err := d.DB.Exec(
-		`UPDATE outbox SET status = 'SENT', sent_at = datetime('now') WHERE id = ?`, id); err != nil {
+		`UPDATE outbox SET status = 'SENT', sent_at = now() WHERE id = $1`, id); err != nil {
 		log.Printf("outbox: tandai sent #%d: %v", id, err)
 		return
 	}
@@ -111,7 +111,7 @@ func (d *Dispatcher) recordSent(id int64) {
 func (d *Dispatcher) recordFailure(id int64, attempts int, cause error) {
 	if attempts >= d.MaxAttempts {
 		if _, err := d.DB.Exec(
-			`UPDATE outbox SET status = 'DEAD', attempts = ?, last_error = ? WHERE id = ?`,
+			`UPDATE outbox SET status = 'DEAD', attempts = $1, last_error = $2 WHERE id = $3`,
 			attempts, cause.Error(), id); err != nil {
 			log.Printf("outbox: tandai dead #%d: %v", id, err)
 			return
@@ -125,7 +125,7 @@ func (d *Dispatcher) recordFailure(id int64, attempts int, cause error) {
 		backoff = d.MaxBackoff
 	}
 	if _, err := d.DB.Exec(
-		`UPDATE outbox SET attempts = ?, next_retry_at = ?, last_error = ? WHERE id = ?`,
+		`UPDATE outbox SET attempts = $1, next_retry_at = $2, last_error = $3 WHERE id = $4`,
 		attempts, time.Now().Add(backoff).UnixMilli(), cause.Error(), id); err != nil {
 		log.Printf("outbox: jadwalkan retry #%d: %v", id, err)
 		return

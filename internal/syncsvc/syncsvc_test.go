@@ -3,21 +3,15 @@ package syncsvc
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"sync"
 	"testing"
 
-	"github.com/iamrpean/ticket-booking-assessment/internal/store"
+	"github.com/iamrpean/ticket-booking-assessment/internal/testdb"
 )
 
 func newService(t *testing.T) *Service {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return &Service{DB: db}
+	return &Service{DB: testdb.New(t)}
 }
 
 // Skenario assessment persis: update kedua (qty=2, v2) tiba duluan, update

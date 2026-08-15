@@ -31,11 +31,11 @@ func (s *Service) Apply(ctx context.Context, u Update) (bool, error) {
 	}
 	res, err := s.DB.ExecContext(ctx, `
 		INSERT INTO ticket_availability (ticket_id, quantity, version)
-		VALUES (?, ?, ?)
-		ON CONFLICT(ticket_id) DO UPDATE SET
+		VALUES ($1, $2, $3)
+		ON CONFLICT (ticket_id) DO UPDATE SET
 			quantity   = excluded.quantity,
 			version    = excluded.version,
-			updated_at = datetime('now')
+			updated_at = now()
 		WHERE excluded.version > ticket_availability.version`,
 		u.TicketID, u.Quantity, u.Version)
 	if err != nil {
@@ -52,7 +52,7 @@ func (s *Service) Apply(ctx context.Context, u Update) (bool, error) {
 func (s *Service) Get(ctx context.Context, ticketID string) (Update, error) {
 	u := Update{TicketID: ticketID}
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT quantity, version FROM ticket_availability WHERE ticket_id = ?`,
+		`SELECT quantity, version FROM ticket_availability WHERE ticket_id = $1`,
 		ticketID).Scan(&u.Quantity, &u.Version)
 	return u, err
 }

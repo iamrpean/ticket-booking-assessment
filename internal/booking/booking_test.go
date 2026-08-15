@@ -4,21 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/iamrpean/ticket-booking-assessment/internal/store"
+	"github.com/iamrpean/ticket-booking-assessment/internal/testdb"
 )
 
 // 100 pembeli rebutan 1 tiket VIP tersisa: harus tepat 1 yang berhasil,
 // sisanya ditolak karena habis, stok akhir 0, dan cuma ada 1 baris purchase.
 func TestBuy_SatuTiketBanyakPembeli(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := testdb.New(t)
 	if err := store.SeedTicket(db, "vip-1", "VIP", 1); err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +71,7 @@ func TestBuy_SatuTiketBanyakPembeli(t *testing.T) {
 // Scenario 3: pembelian sukses harus meninggalkan baris outbox PENDING
 // dalam transaksi yang sama - modal si dispatcher untuk kirim ke accounting.
 func TestBuy_MencatatOutbox(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	db := testdb.New(t)
 	if err := store.SeedTicket(db, "vip-1", "VIP", 1); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +84,7 @@ func TestBuy_MencatatOutbox(t *testing.T) {
 
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(1) FROM outbox WHERE kind = 'purchase'
-		AND ref_id = ? AND status = 'PENDING'`, fmt.Sprint(p.ID)).Scan(&n); err != nil {
+		AND ref_id = $1 AND status = 'PENDING'`, fmt.Sprint(p.ID)).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
@@ -110,12 +102,7 @@ func TestBuy_MencatatOutbox(t *testing.T) {
 }
 
 func TestBuy_TiketTidakAda(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
+	db := testdb.New(t)
 	svc := &Service{DB: db}
 	if _, err := svc.Buy(context.Background(), "ghost", "user-1", 500); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("harusnya ErrNotFound, dapat %v", err)

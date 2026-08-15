@@ -30,7 +30,8 @@ func env(key, def string) string {
 
 func main() {
 	port := env("PORT", "8080")
-	dbPath := env("DB_PATH", "data.db")
+	databaseURL := env("DATABASE_URL",
+		"postgres://ticket:ticket@localhost:5432/ticket?sslmode=disable")
 	mockPort := env("MOCK_PORT", "9090")
 	accountingURL := env("ACCOUNTING_URL", "http://localhost:"+mockPort+"/transaction")
 	mockFailFirst, err := strconv.Atoi(env("MOCK_FAIL_FIRST", "2"))
@@ -38,7 +39,7 @@ func main() {
 		log.Fatalf("MOCK_FAIL_FIRST bukan angka: %v", err)
 	}
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(databaseURL)
 	if err != nil {
 		log.Fatalf("buka db: %v", err)
 	}

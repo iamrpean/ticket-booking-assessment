@@ -149,7 +149,7 @@ func (d Deps) handleGetTicket(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var name string
 	var stock int
-	err := d.DB.QueryRow(`SELECT name, stock FROM tickets WHERE id = ?`, id).Scan(&name, &stock)
+	err := d.DB.QueryRow(`SELECT name, stock FROM tickets WHERE id = $1`, id).Scan(&name, &stock)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tiket tidak ditemukan"})
 		return

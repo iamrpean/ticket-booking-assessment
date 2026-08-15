@@ -5,21 +5,16 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/iamrpean/ticket-booking-assessment/internal/store"
+	"github.com/iamrpean/ticket-booking-assessment/internal/testdb"
 )
 
 func newDispatcher(t *testing.T, target string, client *http.Client, maxAttempts int) (*Dispatcher, *sql.DB, context.CancelFunc) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := testdb.New(t)
 
 	d := &Dispatcher{
 		DB:          db,
@@ -41,7 +36,7 @@ func waitStatus(t *testing.T, db *sql.DB, id int64, want string) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		var got string
-		if err := db.QueryRow(`SELECT status FROM outbox WHERE id = ?`, id).Scan(&got); err != nil {
+		if err := db.QueryRow(`SELECT status FROM outbox WHERE id = $1`, id).Scan(&got); err != nil {
 			t.Fatal(err)
 		}
 		if got == want {
@@ -71,11 +66,11 @@ func TestDispatcher_Retry500SampaiTerkirim(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	_, db, _ := newDispatcher(t, ts.URL, ts.Client(), 8)
-	res, err := db.Exec(`INSERT INTO outbox (kind, ref_id, payload) VALUES ('purchase', '1', '{"amount":500}')`)
-	if err != nil {
+	var id int64
+	if err := db.QueryRow(`INSERT INTO outbox (kind, ref_id, payload)
+		VALUES ('purchase', '1', '{"amount":500}') RETURNING id`).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	id, _ := res.LastInsertId()
 
 	waitStatus(t, db, id, "SENT")
 
@@ -103,11 +98,11 @@ func TestDispatcher_DeadLetterSetelahMaxAttempts(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	_, db, _ := newDispatcher(t, ts.URL, ts.Client(), 3)
-	res, err := db.Exec(`INSERT INTO outbox (kind, ref_id, payload) VALUES ('purchase', '1', '{}')`)
-	if err != nil {
+	var id int64
+	if err := db.QueryRow(`INSERT INTO outbox (kind, ref_id, payload)
+		VALUES ('purchase', '1', '{}') RETURNING id`).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	id, _ := res.LastInsertId()
 
 	waitStatus(t, db, id, "DEAD")
 

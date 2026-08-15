@@ -37,7 +37,7 @@ func (s *Service) Buy(ctx context.Context, ticketID, userID string, amount int64
 	defer tx.Rollback()
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE tickets SET stock = stock - 1 WHERE id = ? AND stock > 0`, ticketID)
+		`UPDATE tickets SET stock = stock - 1 WHERE id = $1 AND stock > 0`, ticketID)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (s *Service) Buy(ctx context.Context, ticketID, userID string, amount int64
 		// kalah rebutan stok, atau tiketnya memang tidak ada
 		var exists int
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(1) FROM tickets WHERE id = ?`, ticketID).Scan(&exists); err != nil {
+			`SELECT COUNT(1) FROM tickets WHERE id = $1`, ticketID).Scan(&exists); err != nil {
 			return nil, err
 		}
 		if exists == 0 {
@@ -58,13 +58,12 @@ func (s *Service) Buy(ctx context.Context, ticketID, userID string, amount int64
 		return nil, ErrSoldOut
 	}
 
-	res, err = tx.ExecContext(ctx,
-		`INSERT INTO purchases (ticket_id, user_id, amount) VALUES (?, ?, ?)`,
-		ticketID, userID, amount)
-	if err != nil {
+	var id int64
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO purchases (ticket_id, user_id, amount) VALUES ($1, $2, $3) RETURNING id`,
+		ticketID, userID, amount).Scan(&id); err != nil {
 		return nil, err
 	}
-	id, _ := res.LastInsertId()
 
 	// Baris outbox ditulis dalam transaksi yang SAMA (transactional outbox):
 	// tidak mungkin ada pembelian sukses tanpa jadwal kirim ke accounting,
@@ -78,7 +77,7 @@ func (s *Service) Buy(ctx context.Context, ticketID, userID string, amount int64
 		"occurred_at": time.Now().UTC().Format(time.RFC3339),
 	})
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO outbox (kind, ref_id, payload) VALUES ('purchase', ?, ?)`,
+		`INSERT INTO outbox (kind, ref_id, payload) VALUES ('purchase', $1, $2)`,
 		strconv.FormatInt(id, 10), string(payload)); err != nil {
 		return nil, err
 	}

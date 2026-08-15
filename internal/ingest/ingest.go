@@ -126,7 +126,7 @@ func (s *Service) insertBatch(batch []item) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(
-		`INSERT INTO transactions (id, ticket_id, user_id, amount) VALUES (?, ?, ?, ?)`)
+		`INSERT INTO transactions (id, ticket_id, user_id, amount) VALUES ($1, $2, $3, $4)`)
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func (s *Service) insertBatch(batch []item) error {
 	// outbox ikut ditulis di transaksi batch yang sama (Scenario 3):
 	// transaksi tersimpan dan jadwal kirim ke accounting-nya atomik.
 	obStmt, err := tx.Prepare(
-		`INSERT INTO outbox (kind, ref_id, payload) VALUES ('transaction', ?, ?)`)
+		`INSERT INTO outbox (kind, ref_id, payload) VALUES ('transaction', $1, $2)`)
 	if err != nil {
 		return err
 	}
