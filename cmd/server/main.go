@@ -7,23 +7,33 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/iamrpean/ticket-booking-assessment/internal/api"
 	"github.com/iamrpean/ticket-booking-assessment/internal/booking"
 	"github.com/iamrpean/ticket-booking-assessment/internal/ingest"
+	"github.com/iamrpean/ticket-booking-assessment/internal/mockacct"
+	"github.com/iamrpean/ticket-booking-assessment/internal/outbox"
 	"github.com/iamrpean/ticket-booking-assessment/internal/store"
 )
 
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = "data.db"
+	return def
+}
+
+func main() {
+	port := env("PORT", "8080")
+	dbPath := env("DB_PATH", "data.db")
+	mockPort := env("MOCK_PORT", "9090")
+	accountingURL := env("ACCOUNTING_URL", "http://localhost:"+mockPort+"/transaction")
+	mockFailFirst, err := strconv.Atoi(env("MOCK_FAIL_FIRST", "2"))
+	if err != nil {
+		log.Fatalf("MOCK_FAIL_FIRST bukan angka: %v", err)
 	}
 
 	db, err := store.Open(dbPath)
@@ -39,6 +49,15 @@ func main() {
 
 	bookingSvc := &booking.Service{DB: db}
 	ingestSvc := ingest.New(db, 4096, 200, 20*time.Millisecond)
+	dispatcher := &outbox.Dispatcher{
+		DB:          db,
+		TargetURL:   accountingURL,
+		Client:      &http.Client{Timeout: 5 * time.Second},
+		PollEvery:   500 * time.Millisecond,
+		BaseBackoff: 1 * time.Second,
+		MaxBackoff:  30 * time.Second,
+		MaxAttempts: 8,
+	}
 
 	srv := &http.Server{
 		Addr: ":" + port,
@@ -46,13 +65,26 @@ func main() {
 			DB:      db,
 			Booking: bookingSvc,
 			Ingest:  ingestSvc,
+			Outbox:  dispatcher,
 		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	mockSrv := &http.Server{
+		Addr:              ":" + mockPort,
+		Handler:           mockacct.New(mockFailFirst).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	go dispatcher.Run(ctx)
+	go func() {
+		log.Printf("mock accounting di :%s (membalas 500 %dx pertama per kiriman)", mockPort, mockFailFirst)
+		if err := mockSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
 	go func() {
 		log.Printf("server listen di :%s", port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -65,5 +97,6 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	_ = mockSrv.Shutdown(shutdownCtx)
 	ingestSvc.Close() // setelah server berhenti terima request, kuras sisa antrian
 }

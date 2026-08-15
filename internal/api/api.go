@@ -9,12 +9,14 @@ import (
 
 	"github.com/iamrpean/ticket-booking-assessment/internal/booking"
 	"github.com/iamrpean/ticket-booking-assessment/internal/ingest"
+	"github.com/iamrpean/ticket-booking-assessment/internal/outbox"
 )
 
 type Deps struct {
 	DB      *sql.DB
 	Booking *booking.Service
 	Ingest  *ingest.Service
+	Outbox  *outbox.Dispatcher
 }
 
 func New(d Deps) *http.ServeMux {
@@ -26,7 +28,18 @@ func New(d Deps) *http.ServeMux {
 	mux.HandleFunc("POST /purchase", d.handlePurchase)
 	mux.HandleFunc("GET /tickets/{id}", d.handleGetTicket)
 	mux.HandleFunc("POST /transactions", d.handleSubmitTransaction)
+	mux.HandleFunc("GET /outbox/stats", d.handleOutboxStats)
 	return mux
+}
+
+func (d Deps) handleOutboxStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := d.Outbox.Stats(r.Context())
+	if err != nil {
+		log.Printf("outbox stats: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 type purchaseReq struct {
