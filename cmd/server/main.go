@@ -17,6 +17,7 @@ import (
 	"github.com/iamrpean/ticket-booking-assessment/internal/mockacct"
 	"github.com/iamrpean/ticket-booking-assessment/internal/outbox"
 	"github.com/iamrpean/ticket-booking-assessment/internal/store"
+	"github.com/iamrpean/ticket-booking-assessment/internal/syncsvc"
 	"github.com/iamrpean/ticket-booking-assessment/internal/webhook"
 )
 
@@ -51,6 +52,7 @@ func main() {
 	bookingSvc := &booking.Service{DB: db}
 	ingestSvc := ingest.New(db, 4096, 200, 20*time.Millisecond)
 	webhookSvc := &webhook.Service{DB: db}
+	syncSvc := &syncsvc.Service{DB: db}
 	dispatcher := &outbox.Dispatcher{
 		DB:          db,
 		TargetURL:   accountingURL,
@@ -69,6 +71,7 @@ func main() {
 			Ingest:  ingestSvc,
 			Outbox:  dispatcher,
 			Webhook: webhookSvc,
+			Sync:    syncSvc,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

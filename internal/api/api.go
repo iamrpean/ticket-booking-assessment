@@ -11,6 +11,7 @@ import (
 	"github.com/iamrpean/ticket-booking-assessment/internal/booking"
 	"github.com/iamrpean/ticket-booking-assessment/internal/ingest"
 	"github.com/iamrpean/ticket-booking-assessment/internal/outbox"
+	"github.com/iamrpean/ticket-booking-assessment/internal/syncsvc"
 	"github.com/iamrpean/ticket-booking-assessment/internal/webhook"
 )
 
@@ -20,6 +21,7 @@ type Deps struct {
 	Ingest  *ingest.Service
 	Outbox  *outbox.Dispatcher
 	Webhook *webhook.Service
+	Sync    *syncsvc.Service
 }
 
 func New(d Deps) *http.ServeMux {
@@ -33,7 +35,45 @@ func New(d Deps) *http.ServeMux {
 	mux.HandleFunc("POST /transactions", d.handleSubmitTransaction)
 	mux.HandleFunc("GET /outbox/stats", d.handleOutboxStats)
 	mux.HandleFunc("POST /webhook/payment", d.handlePaymentWebhook)
+	mux.HandleFunc("POST /sync/availability", d.handleSyncApply)
+	mux.HandleFunc("GET /sync/availability/{id}", d.handleSyncGet)
 	return mux
+}
+
+func (d Deps) handleSyncApply(w http.ResponseWriter, r *http.Request) {
+	var u syncsvc.Update
+	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body bukan json valid"})
+		return
+	}
+
+	applied, err := d.Sync.Apply(r.Context(), u)
+	switch {
+	case errors.Is(err, syncsvc.ErrInvalid):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case err != nil:
+		log.Printf("sync apply: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	case applied:
+		writeJSON(w, http.StatusOK, map[string]any{"applied": true})
+	default:
+		// update basi di-ack supaya pengirim tidak retry; datanya diabaikan
+		writeJSON(w, http.StatusOK, map[string]any{"applied": false, "reason": "stale version"})
+	}
+}
+
+func (d Deps) handleSyncGet(w http.ResponseWriter, r *http.Request) {
+	u, err := d.Sync.Get(r.Context(), r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "belum ada data availability"})
+		return
+	}
+	if err != nil {
+		log.Printf("sync get: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
 }
 
 func (d Deps) handlePaymentWebhook(w http.ResponseWriter, r *http.Request) {
