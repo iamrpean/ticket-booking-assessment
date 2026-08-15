@@ -29,6 +29,23 @@ CREATE TABLE IF NOT EXISTS transactions (
 	amount     INTEGER NOT NULL,
 	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Outbox: baris dibuat dalam transaksi DB yang SAMA dengan penulisan
+-- transaksinya, lalu dikirim ke pihak ketiga oleh dispatcher terpisah.
+-- next_retry_at berupa unix milli supaya perhitungan backoff ada di Go.
+CREATE TABLE IF NOT EXISTS outbox (
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	kind          TEXT NOT NULL,             -- 'purchase' | 'transaction'
+	ref_id        TEXT NOT NULL,
+	payload       TEXT NOT NULL,
+	status        TEXT NOT NULL DEFAULT 'PENDING', -- PENDING | SENT | DEAD
+	attempts      INTEGER NOT NULL DEFAULT 0,
+	next_retry_at INTEGER NOT NULL DEFAULT 0,
+	last_error    TEXT,
+	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	sent_at       DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_retry_at);
 `
 
 // Open membuka database sqlite dan menjalankan migrasi skema.
