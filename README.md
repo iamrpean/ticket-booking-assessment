@@ -17,7 +17,7 @@ Env lain: `DB_PATH` (default `data.db`), `ACCOUNTING_URL` (default menunjuk ke m
 
 ## Scenario 1 - Race Condition
 
-**Masalah.** Alur lama: baca stok -> cek di aplikasi -> kurangi stok -> simpan transaksi. Antara "baca" dan "kurangi" ada jeda waktu. Dua request yang datang hampir bersamaan sama-sama membaca stok `1`, sama-sama lolos pengecekan, dan sama-sama jadi membeli - 1 tiket terjual 2 kali.
+**Masalah.** Alur lama: baca stok -> cek di aplikasi -> kurangi stok -> simpan transaksi. Antara "baca" dan "kurangi" ada jeda waktu. Dua request yang datang hampir bersamaan sama-sama membaca stok `1`, sama-sama lolos pengecekan, dan sama-sama jadi membeli. Ujungnya 1 tiket terjual 2 kali.
 
 **Solusi.** Pengecekan dan pengurangan stok dipindah ke database sebagai satu statement atomik, dibungkus satu transaksi bersama insert pembelian:
 
@@ -27,11 +27,11 @@ UPDATE tickets SET stock = stock - 1 WHERE id = ? AND stock > 0
 -- rows affected = 0 -> tiket habis, ROLLBACK -> 409
 ```
 
-Database mengeksekusi UPDATE pada baris yang sama secara serial, jadi hanya satu request yang menemukan `stock > 0` bernilai benar. Request yang kalah tidak "lolos cek lalu gagal tulis" - cek dan tulisnya memang satu operasi.
+Database mengeksekusi UPDATE pada baris yang sama secara serial, jadi hanya satu request yang menemukan `stock > 0` bernilai benar. Request yang kalah tidak "lolos cek lalu gagal tulis", karena cek dan tulisnya memang satu operasi.
 
 **Asumsi.** Satu instance aplikasi dan SQLite cukup untuk skala assessment. Pola conditional update ini identik perilakunya di PostgreSQL/MySQL, jadi solusinya tidak terikat SQLite.
 
-**Trade-off.** Penulisan ke baris tiket yang sama otomatis terserialisasi - aman, tapi jadi titik antrian kalau satu tiket diserbu ekstrem (puluhan ribu req/detik ke baris yang sama). Di skala itu alternatifnya reservation queue atau stok terpartisi, dengan kompleksitas jauh lebih tinggi.
+**Trade-off.** Penulisan ke baris tiket yang sama otomatis terserialisasi. Aman, tapi jadi titik antrian kalau satu tiket diserbu ekstrem (puluhan ribu req/detik ke baris yang sama). Di skala itu alternatifnya reservation queue atau stok terpartisi, dengan kompleksitas jauh lebih tinggi.
 
 ```mermaid
 flowchart TD
@@ -45,7 +45,7 @@ flowchart TD
     G --> H[409 Conflict - tiket habis]
 ```
 
-**Demo.** Dua pembeli berebut 1 tiket VIP terakhir - satu dapat `201`, satunya `409`:
+**Demo.** Dua pembeli berebut 1 tiket VIP terakhir, satu dapat `201`, satunya `409`:
 
 ```
 curl -s -X POST localhost:8080/purchase -d '{"ticket_id":"vip-1","user_id":"andi","amount":500}' &
@@ -56,9 +56,9 @@ curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
 
 ## Scenario 2 - High Traffic Processing
 
-**Masalah.** Lebih dari 10.000 transaksi masuk dalam waktu kurang dari 1 menit, dan setiap transaksi yang dijawab sukses harus benar-benar tersimpan - tidak boleh ada yang hilang diam-diam.
+**Masalah.** Lebih dari 10.000 transaksi masuk dalam waktu kurang dari 1 menit, dan setiap transaksi yang dijawab sukses harus benar-benar tersimpan, tidak boleh ada yang hilang diam-diam.
 
-**Analisis.** Dua jebakan umum di sini: (1) commit database per request - tiap commit memaksa fsync, jadi throughput mentok jauh di bawah kebutuhan; (2) solusi naifnya, "lempar ke antrian lalu langsung balas sukses" - throughput naik tapi janji sukses diberikan *sebelum* data aman, persis sumber transaksi hilang saat proses mati.
+**Analisis.** Dua jebakan umum di sini. Pertama, commit database per request: tiap commit memaksa fsync, jadi throughput mentok jauh di bawah kebutuhan. Kedua, solusi naifnya "lempar ke antrian lalu langsung balas sukses": throughput naik, tapi janji sukses diberikan *sebelum* data aman. Di situlah transaksi hilang kalau proses mati.
 
 **Solusi.** Antrian bounded + satu worker yang menulis secara batch, dengan aturan ketat: **response sukses baru dikirim setelah batch berisi transaksi itu ter-commit**.
 
@@ -67,11 +67,11 @@ curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
 - Antrian penuh -> `Submit` menunggu (backpressure), bukan menerima-lalu-hilang.
 - Saat shutdown (SIGTERM), server berhenti menerima request baru lalu menguras sisa antrian sampai habis sebelum keluar.
 
-Hasil di mesin uji: 10.000 transaksi persisten dalam ~1,4 detik (~7.000 tx/detik; sebelum tiap transaksi ikut menulis baris outbox Scenario 3, ~18.000 tx/detik) - kebutuhan soal hanya ~167 tx/detik.
+Hasil di mesin uji: 10.000 transaksi persisten dalam ~1,4 detik alias ~7.000 tx/detik (sebelum tiap transaksi ikut menulis baris outbox Scenario 3, ~18.000 tx/detik). Kebutuhan soal hanya ~167 tx/detik.
 
 **Asumsi.** "Sukses" didefinisikan dari sudut pandang client: transaksi disebut sukses hanya kalau sudah menerima `201`, dan `201` hanya keluar setelah data persisten. Client yang tidak menerima jawaban (timeout/putus) wajib menganggap statusnya tidak pasti dan boleh mengirim ulang.
 
-**Trade-off.** Latency per request naik sebesar jendela flush (<=20ms) - harga yang wajar untuk jaminan durability. Satu baris rusak menggagalkan seluruh batch-nya (semua waiter diberi error, tidak ada yang dibohongi "sukses"). Antrian in-memory hilang kalau proses crash, tapi karena ack-setelah-persist, yang hilang hanyalah request yang memang belum dijawab sukses - client tahu dan bisa retry. Di skala multi-node, antrian ini digantikan message broker durable (Kafka/RabbitMQ) dengan prinsip yang sama: ack setelah persisten.
+**Trade-off.** Latency per request naik sebesar jendela flush (maksimal 20ms), harga yang wajar untuk jaminan durability. Satu baris rusak menggagalkan seluruh batch-nya (semua waiter diberi error, tidak ada yang dibohongi "sukses"). Antrian in-memory hilang kalau proses crash, tapi karena ack-setelah-persist, yang hilang hanyalah request yang memang belum dijawab sukses, jadi client tahu dan bisa retry. Di skala multi-node, antrian ini digantikan message broker durable (Kafka/RabbitMQ) dengan prinsip yang sama: ack setelah persisten.
 
 ```mermaid
 flowchart TD
@@ -91,24 +91,24 @@ flowchart TD
 
 ```
 curl -s -X POST localhost:8080/transactions -d '{"ticket_id":"vip-1","user_id":"cici","amount":100}'
-# -> {"id":"tx-...","status":"stored"}   <- dikirim SETELAH data ter-commit
+# {"id":"tx-...","status":"stored"}  (respon dikirim SETELAH data ter-commit)
 ```
 
 ## Scenario 3 - External API Integration
 
-**Masalah.** Setiap transaksi sukses harus sampai ke accounting software pihak ketiga (`POST /transaction`), tapi pihak ketiga bisa membalas `HTTP 500`, timeout, atau tidak terjangkau. Dua cara yang salah: mengirim *sebelum* commit (kalau commit batal, accounting mencatat transaksi yang tidak pernah ada) dan mengirim *setelah* commit tanpa pencatatan (kalau proses mati di antara keduanya, transaksi tersimpan tapi tidak pernah terkirim - hilang diam-diam).
+**Masalah.** Setiap transaksi sukses harus sampai ke accounting software pihak ketiga (`POST /transaction`), tapi pihak ketiga bisa membalas `HTTP 500`, timeout, atau tidak terjangkau. Dua cara yang salah: mengirim *sebelum* commit (kalau commit batal, accounting mencatat transaksi yang tidak pernah ada) dan mengirim *setelah* commit tanpa pencatatan (kalau proses mati di antara keduanya, transaksi tersimpan tapi tidak pernah terkirim, alias hilang diam-diam).
 
-**Solusi: transactional outbox.** Niat mengirim dicatat sebagai baris di tabel `outbox` **dalam transaksi database yang sama** dengan penulisan transaksinya - dua-duanya jadi atomik: sama-sama tersimpan, atau sama-sama batal. Dispatcher terpisah lalu membaca baris `PENDING` dan mengirimkannya:
+**Solusi: transactional outbox.** Niat mengirim dicatat sebagai baris di tabel `outbox` **dalam transaksi database yang sama** dengan penulisan transaksinya, jadi dua-duanya atomik: sama-sama tersimpan, atau sama-sama batal. Dispatcher terpisah lalu membaca baris `PENDING` dan mengirimkannya:
 
-- Gagal (`500`/timeout/putus) -> dijadwalkan ulang dengan **exponential backoff** (1s, 2s, 4s, ... maks 30s) supaya pihak ketiga yang sedang sakit tidak dihujani request.
-- Setelah 8 kali gagal -> status `DEAD` (dead letter): berhenti retry otomatis, menunggu penanganan manual - baris rusak tidak boleh menyandera antrian selamanya.
+- Gagal (`500`/timeout/putus) -> dijadwalkan ulang dengan **exponential backoff** (1s, 2s, 4s, ... maks 30s) supaya pihak ketiga yang sedang bermasalah tidak makin terbebani.
+- Setelah 8 kali gagal -> status `DEAD` (dead letter): berhenti retry otomatis, menunggu penanganan manual. Baris yang memang rusak tidak boleh di-retry tanpa akhir.
 - Setiap kiriman membawa header `X-Idempotency-Key` yang stabil di semua retry, supaya pihak ketiga bisa mendeteksi kiriman ulang (retry sukses yang balasannya hilang di jalan tidak jadi dobel di sisi mereka).
 
 Kedua jalur transaksi memakai pola ini: pembelian tiket (S1) dan ingest volume tinggi (S2, baris outbox ikut di transaksi batch).
 
 **Asumsi.** Pihak ketiga pada akhirnya pulih (transient failure); jaminan yang diberikan *at-least-once delivery* + idempotency key, karena *exactly-once* lintas jaringan tidak mungkin tanpa kerja sama kedua sisi.
 
-**Trade-off.** Ada jeda antara transaksi tersimpan dan terkirim ke accounting (eventual consistency) - konsekuensi yang memang diinginkan: pembelian user tidak boleh gagal cuma karena sistem accounting sedang down. Polling dispatcher menambah beban baca ringan; di skala besar polling diganti CDC/notifikasi, polanya tetap sama.
+**Trade-off.** Ada jeda antara transaksi tersimpan dan terkirim ke accounting (eventual consistency). Ini konsekuensi yang memang diinginkan: pembelian user tidak boleh gagal cuma karena sistem accounting sedang down. Polling dispatcher menambah beban baca ringan; di skala besar polling diganti CDC/notifikasi, polanya tetap sama.
 
 ```mermaid
 flowchart TD
@@ -140,21 +140,21 @@ curl -s localhost:9090/stats            # {"received":1} - diterima tepat sekali
 
 ## Scenario 4 - Duplicate Request
 
-**Masalah.** Pihak ketiga memproses transaksi di background lalu mengirim webhook berisi data payment untuk disimpan ke `transaction_payment`. Karena respon kita tidak sampai ke mereka (masalah jaringan), mereka retry - dan karena anomali, dua request dengan data identik bisa datang **di waktu yang sama**. Tanpa penanganan, satu payment tercatat dua kali.
+**Masalah.** Pihak ketiga memproses transaksi di background lalu mengirim webhook berisi data payment untuk disimpan ke `transaction_payment`. Karena respon kita tidak sampai ke mereka (masalah jaringan), mereka retry. Karena anomali, dua request dengan data identik bahkan bisa datang **di waktu yang sama**. Tanpa penanganan, satu payment tercatat dua kali.
 
 **Analisis.** Ini race condition Scenario 1 dalam wujud lain. Dedup yang dicek di aplikasi ("SELECT dulu, kalau belum ada baru INSERT") punya celah waktu yang sama: dua request bersamaan sama-sama tidak menemukan baris, lalu sama-sama insert. Pengecekannya harus atomik.
 
-**Solusi.** Keunikan ditegakkan di database - `UNIQUE(payment_id)` + `ON CONFLICT DO NOTHING`:
+**Solusi.** Keunikan ditegakkan di database lewat `UNIQUE(payment_id)` + `ON CONFLICT DO NOTHING`:
 
 - Request pertama (siapa pun pemenangnya) -> baris tersimpan -> `200 {"status":"stored"}`.
-- Request duplikat, sesimultan apa pun -> diserap constraint -> `200 {"duplicate":true}`.
-- Duplikat **tetap dibalas 200**, bukan error - konsumer idempoten yang membalas error untuk duplikat justru membuat pihak ketiga retry tanpa henti. 200 artinya "data ini sudah aman di saya", dan itu benar.
+- Request duplikat, meski datang bersamaan -> diserap constraint -> `200 {"duplicate":true}`.
+- Duplikat **tetap dibalas 200**, bukan error. Konsumer idempoten yang membalas error untuk duplikat justru membuat pihak ketiga retry tanpa henti; 200 artinya "data ini sudah aman di saya", dan itu benar.
 
 Ini pasangan simetris dari Scenario 3: saat mengirim, kita menyertakan `X-Idempotency-Key` supaya pihak ketiga bisa dedup; saat menerima, kita melakukan dedup yang sama memakai `payment_id` mereka.
 
 **Asumsi.** `payment_id` dari pihak ketiga stabil antar retry (itulah kontrak idempotency key). Kalau pihak ketiga tidak menyediakannya, gantinya hash deterministik dari konten payload. Payload mentah ikut disimpan untuk audit.
 
-**Trade-off.** Satu unique index - biaya kecil. Perlu disepakati juga masa simpan key-nya; di sini permanen (ukuran data assessment), di produksi biasanya cukup selama jendela retry pihak ketiga.
+**Trade-off.** Biayanya cuma satu unique index. Perlu disepakati juga masa simpan key-nya; di sini permanen (ukuran data assessment), di produksi biasanya cukup selama jendela retry pihak ketiga.
 
 ```mermaid
 flowchart TD
@@ -178,9 +178,9 @@ curl -s -X POST localhost:8080/webhook/payment -d "$BODY"   # {"duplicate":true,
 
 ## Scenario 5 - Data Synchronization
 
-**Masalah.** Sistem tiket mengirim update ketersediaan ke sistem lain: update pertama `quantity=5`, update kedua `quantity=2`. Karena latency jaringan, update kedua tiba lebih dulu - lalu update pertama yang telat menimpanya. Sistem tujuan menampilkan 5, padahal kondisi sebenarnya 2. Akar masalahnya: *last-write-wins berdasarkan waktu kedatangan*, padahal jaringan tidak pernah menjanjikan urutan kedatangan.
+**Masalah.** Sistem tiket mengirim update ketersediaan ke sistem lain: update pertama `quantity=5`, update kedua `quantity=2`. Karena latency jaringan, update kedua tiba lebih dulu, lalu update pertama yang telat menimpanya. Sistem tujuan menampilkan 5, padahal kondisi sebenarnya 2. Akar masalahnya: *last-write-wins berdasarkan waktu kedatangan*, padahal jaringan tidak pernah menjanjikan urutan kedatangan.
 
-**Solusi.** Urutan tidak boleh disimpulkan dari kedatangan - ia harus dibawa oleh datanya sendiri. Setiap update membawa `version` yang monoton naik dari sistem sumber, dan penerima hanya menerapkan update yang version-nya **lebih besar** dari yang tersimpan:
+**Solusi.** Urutan tidak boleh disimpulkan dari kedatangan; urutan harus dibawa oleh datanya sendiri. Setiap update membawa `version` yang monoton naik dari sistem sumber, dan penerima hanya menerapkan update yang version-nya **lebih besar** dari yang tersimpan:
 
 ```sql
 INSERT INTO ticket_availability (ticket_id, quantity, version) VALUES (?, ?, ?)
@@ -188,11 +188,11 @@ ON CONFLICT(ticket_id) DO UPDATE SET quantity = excluded.quantity, version = exc
 WHERE excluded.version > ticket_availability.version
 ```
 
-Guard-nya berada **di dalam** statement upsert - bukan "SELECT version dulu, bandingkan di aplikasi, baru tulis", yang punya celah waktu yang sama dengan Scenario 1. Update basi dijawab `200 {"applied":false,"reason":"stale version"}`: tetap di-ack supaya pengirim tidak retry, tapi datanya diabaikan.
+Guard-nya berada **di dalam** statement upsert, bukan "SELECT version dulu, bandingkan di aplikasi, baru tulis" yang punya celah waktu yang sama dengan Scenario 1. Update basi dijawab `200 {"applied":false,"reason":"stale version"}`: tetap di-ack supaya pengirim tidak retry, tapi datanya diabaikan.
 
 **Asumsi.** Sumber sanggup menerbitkan version monoton per tiket (counter yang di-increment atomik di database sumber). Alternatif version: timestamp sumber (rentan clock skew antar mesin) atau sequence dari message broker.
 
-**Trade-off.** Update dikirim *full-state* (nilai quantity utuh), bukan delta - kalau ada update yang hilang di tengah, update terbaru tetap self-contained dan hasil akhirnya benar; delta menuntut urutan sempurna tanpa lubang, jauh lebih rapuh. Harganya: semua pengirim harus disiplin lewat kontrak version - satu pengirim yang menulis tanpa version merusak jaminannya.
+**Trade-off.** Update dikirim *full-state* (nilai quantity utuh), bukan delta. Kalau ada update yang hilang di tengah, update terbaru tetap self-contained dan hasil akhirnya benar; delta menuntut urutan sempurna tanpa lubang, jauh lebih rapuh. Harganya: semua pengirim harus disiplin lewat kontrak version, karena satu pengirim saja yang menulis tanpa version sudah merusak jaminannya.
 
 ```mermaid
 flowchart TD
@@ -216,7 +216,7 @@ curl -s localhost:8080/sync/availability/vip-1    # quantity=2, version=2
 
 ## Diagram flow gabungan
 
-Kelima skenario dalam satu kesatuan - satu aplikasi, satu database, dua arah integrasi dengan dunia luar:
+Kelima skenario dalam satu kesatuan: satu aplikasi, satu database, dua arah integrasi dengan dunia luar.
 
 ```mermaid
 flowchart LR
@@ -242,8 +242,8 @@ flowchart LR
     end
 
     DB[("SQLite
-    tickets * purchases * transactions
-    outbox * transaction_payment
+    tickets, purchases, transactions,
+    outbox, transaction_payment,
     ticket_availability")]
 
     B --> P
@@ -259,7 +259,7 @@ flowchart LR
     V --> DB
 ```
 
-Benang merah desainnya dua hal. Pertama, **keputusan kritis dieksekusi sebagai satu operasi atomik di database** - cek-dan-kurangi stok (S1), simpan-dan-jadwalkan-kirim (S3), tolak-duplikat (S4), tolak-basi (S5) - karena pengecekan di level aplikasi selalu menyisakan celah waktu di antara baca dan tulis. Kedua, **jaringan dianggap selalu bisa gagal di titik mana pun**: sukses baru diakui setelah data persisten (S2), kiriman keluar dicatat dulu lalu di-retry sampai sampai (S3), dan pesan masuk yang dobel atau telat dikenali lalu diserap tanpa merusak data (S4, S5).
+Benang merah desainnya dua hal. Pertama, **keputusan kritis dieksekusi sebagai satu operasi atomik di database**: cek-dan-kurangi stok (S1), simpan-dan-jadwalkan-kirim (S3), tolak-duplikat (S4), tolak-basi (S5). Alasannya, pengecekan di level aplikasi selalu menyisakan celah waktu antara baca dan tulis. Kedua, **jaringan dianggap selalu bisa gagal di titik mana pun**: sukses baru diakui setelah data persisten (S2), kiriman keluar dicatat dulu lalu di-retry sampai terkirim (S3), dan pesan masuk yang dobel atau telat dikenali lalu diserap tanpa merusak data (S4, S5).
 
 ## Menjalankan demo semua skenario
 
