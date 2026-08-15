@@ -8,7 +8,12 @@ Service pemesanan tiket konser untuk technical assessment. Dibangun dengan Go + 
 go run ./cmd/server
 ```
 
-Server jalan di `:8080` (override dengan env `PORT`, lokasi database dengan `DB_PATH`, default `data.db`). Saat start, tiket `vip-1` di-seed dengan stok 1 sesuai skenario assessment.
+Aplikasi menjalankan dua listener:
+
+- `:8080` - API utama (env `PORT`)
+- `:9090` - mock accounting pihak ketiga (env `MOCK_PORT`), sengaja membalas `500` dua kali pertama per kiriman untuk mendemonstrasikan retry Scenario 3 (atur lewat `MOCK_FAIL_FIRST`)
+
+Env lain: `DB_PATH` (default `data.db`), `ACCOUNTING_URL` (default menunjuk ke mock). Saat start, tiket `vip-1` di-seed dengan stok 1 sesuai skenario assessment.
 
 ## Scenario 1 - Race Condition
 
@@ -62,7 +67,7 @@ curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
 - Antrian penuh -> `Submit` menunggu (backpressure), bukan menerima-lalu-hilang.
 - Saat shutdown (SIGTERM), server berhenti menerima request baru lalu menguras sisa antrian sampai habis sebelum keluar.
 
-Hasil di mesin uji: 10.000 transaksi persisten dalam ~0,5 detik (~18.000 tx/detik) - kebutuhan soal hanya ~167 tx/detik.
+Hasil di mesin uji: 10.000 transaksi persisten dalam ~1,4 detik (~7.000 tx/detik; sebelum tiap transaksi ikut menulis baris outbox Scenario 3, ~18.000 tx/detik) - kebutuhan soal hanya ~167 tx/detik.
 
 **Asumsi.** "Sukses" didefinisikan dari sudut pandang client: transaksi disebut sukses hanya kalau sudah menerima `201`, dan `201` hanya keluar setelah data persisten. Client yang tidak menerima jawaban (timeout/putus) wajib menganggap statusnya tidak pasti dan boleh mengirim ulang.
 
@@ -89,6 +94,50 @@ curl -s -X POST localhost:8080/transactions -d '{"ticket_id":"vip-1","user_id":"
 # -> {"id":"tx-...","status":"stored"}   <- dikirim SETELAH data ter-commit
 ```
 
+## Scenario 3 - External API Integration
+
+**Masalah.** Setiap transaksi sukses harus sampai ke accounting software pihak ketiga (`POST /transaction`), tapi pihak ketiga bisa membalas `HTTP 500`, timeout, atau tidak terjangkau. Dua cara yang salah: mengirim *sebelum* commit (kalau commit batal, accounting mencatat transaksi yang tidak pernah ada) dan mengirim *setelah* commit tanpa pencatatan (kalau proses mati di antara keduanya, transaksi tersimpan tapi tidak pernah terkirim - hilang diam-diam).
+
+**Solusi: transactional outbox.** Niat mengirim dicatat sebagai baris di tabel `outbox` **dalam transaksi database yang sama** dengan penulisan transaksinya - dua-duanya jadi atomik: sama-sama tersimpan, atau sama-sama batal. Dispatcher terpisah lalu membaca baris `PENDING` dan mengirimkannya:
+
+- Gagal (`500`/timeout/putus) -> dijadwalkan ulang dengan **exponential backoff** (1s, 2s, 4s, ... maks 30s) supaya pihak ketiga yang sedang sakit tidak dihujani request.
+- Setelah 8 kali gagal -> status `DEAD` (dead letter): berhenti retry otomatis, menunggu penanganan manual - baris rusak tidak boleh menyandera antrian selamanya.
+- Setiap kiriman membawa header `X-Idempotency-Key` yang stabil di semua retry, supaya pihak ketiga bisa mendeteksi kiriman ulang (retry sukses yang balasannya hilang di jalan tidak jadi dobel di sisi mereka).
+
+Kedua jalur transaksi memakai pola ini: pembelian tiket (S1) dan ingest volume tinggi (S2, baris outbox ikut di transaksi batch).
+
+**Asumsi.** Pihak ketiga pada akhirnya pulih (transient failure); jaminan yang diberikan *at-least-once delivery* + idempotency key, karena *exactly-once* lintas jaringan tidak mungkin tanpa kerja sama kedua sisi.
+
+**Trade-off.** Ada jeda antara transaksi tersimpan dan terkirim ke accounting (eventual consistency) - konsekuensi yang memang diinginkan: pembelian user tidak boleh gagal cuma karena sistem accounting sedang down. Polling dispatcher menambah beban baca ringan; di skala besar polling diganti CDC/notifikasi, polanya tetap sama.
+
+```mermaid
+flowchart TD
+    A["Transaksi sukses (purchase / ingest)"] --> B["Transaksi DB yang sama:
+    INSERT data + INSERT outbox status PENDING"]
+    B --> C[COMMIT atomik]
+    C --> D["Dispatcher: poll baris PENDING
+    yang sudah jatuh tempo"]
+    D --> E["POST /transaction
+    + X-Idempotency-Key"]
+    E -->|2xx| F[status = SENT]
+    E -->|500 / timeout| G{"attempts < 8?"}
+    G -->|ya| H["backoff eksponensial
+    next_retry = now + 1s*2^n (maks 30s)"]
+    H --> D
+    G -->|tidak| I["status = DEAD
+    (dead letter, penanganan manual)"]
+```
+
+**Demo.** Mock accounting di `:9090` sengaja membalas `500` dua kali pertama per kiriman:
+
+```
+curl -s -X POST localhost:8080/purchase -d '{"ticket_id":"vip-1","user_id":"andi","amount":500}'
+curl -s localhost:8080/outbox/stats     # {"PENDING":1}
+# log server: percobaan 1 gagal (http 500), retry dalam 1s ... percobaan 2 ... terkirim
+sleep 4 && curl -s localhost:8080/outbox/stats   # {"SENT":1}
+curl -s localhost:9090/stats            # {"received":1} - diterima tepat sekali
+```
+
 ## Testing
 
 ```
@@ -100,3 +149,6 @@ Test kunci per skenario:
 - `TestBuy_SatuTiketBanyakPembeli` (S1) - 100 pembeli serentak ke 1 tiket tersisa: tepat satu berhasil, sisanya `409`, stok akhir 0, hanya 1 baris purchase.
 - `TestSubmit_10RibuSemuaTersimpan` (S2) - 10.000 submit serentak: semua dijawab sukses dan semuanya terhitung di database.
 - `TestSubmit_BatchGagalSemuaDapatError` (S2) - kalau satu batch gagal commit, semua request di batch itu dapat error, tidak ada yang dijawab sukses palsu.
+- `TestDispatcher_Retry500SampaiTerkirim` (S3) - pihak ketiga membalas 500 dua kali lalu pulih: retry jalan, berakhir `SENT`, diterima tepat sekali.
+- `TestDispatcher_DeadLetterSetelahMaxAttempts` (S3) - pihak ketiga mati total: berhenti di `DEAD` setelah batas percobaan, tidak retry selamanya.
+- `TestBuy_MencatatOutbox` / `TestSubmit_MencatatOutbox` (S3) - baris outbox lahir di transaksi DB yang sama; pembelian gagal tidak meninggalkan outbox.
