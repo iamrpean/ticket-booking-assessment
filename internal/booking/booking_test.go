@@ -72,6 +72,43 @@ func TestBuy_SatuTiketBanyakPembeli(t *testing.T) {
 	}
 }
 
+// Scenario 3: pembelian sukses harus meninggalkan baris outbox PENDING
+// dalam transaksi yang sama - modal si dispatcher untuk kirim ke accounting.
+func TestBuy_MencatatOutbox(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := store.SeedTicket(db, "vip-1", "VIP", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &Service{DB: db}
+	p, err := svc.Buy(context.Background(), "vip-1", "andi", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM outbox WHERE kind = 'purchase'
+		AND ref_id = ? AND status = 'PENDING'`, fmt.Sprint(p.ID)).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("harusnya ada 1 baris outbox PENDING untuk purchase %d, dapat %d", p.ID, n)
+	}
+
+	// pembelian gagal (stok habis) tidak boleh menambah outbox
+	_, _ = svc.Buy(context.Background(), "vip-1", "budi", 500)
+	if err := db.QueryRow(`SELECT COUNT(1) FROM outbox`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("pembelian gagal ikut menulis outbox: total %d baris", n)
+	}
+}
+
 func TestBuy_TiketTidakAda(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

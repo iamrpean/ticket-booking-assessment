@@ -3,7 +3,10 @@ package booking
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"strconv"
+	"time"
 )
 
 var (
@@ -62,6 +65,23 @@ func (s *Service) Buy(ctx context.Context, ticketID, userID string, amount int64
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
+
+	// Baris outbox ditulis dalam transaksi yang SAMA (transactional outbox):
+	// tidak mungkin ada pembelian sukses tanpa jadwal kirim ke accounting,
+	// dan tidak mungkin ada jadwal kirim untuk pembelian yang batal.
+	payload, _ := json.Marshal(map[string]any{
+		"type":        "purchase",
+		"purchase_id": id,
+		"ticket_id":   ticketID,
+		"user_id":     userID,
+		"amount":      amount,
+		"occurred_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO outbox (kind, ref_id, payload) VALUES ('purchase', ?, ?)`,
+		strconv.FormatInt(id, 10), string(payload)); err != nil {
+		return nil, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
