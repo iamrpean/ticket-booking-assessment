@@ -4,12 +4,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 
 	"github.com/iamrpean/ticket-booking-assessment/internal/booking"
 	"github.com/iamrpean/ticket-booking-assessment/internal/ingest"
 	"github.com/iamrpean/ticket-booking-assessment/internal/outbox"
+	"github.com/iamrpean/ticket-booking-assessment/internal/webhook"
 )
 
 type Deps struct {
@@ -17,6 +19,7 @@ type Deps struct {
 	Booking *booking.Service
 	Ingest  *ingest.Service
 	Outbox  *outbox.Dispatcher
+	Webhook *webhook.Service
 }
 
 func New(d Deps) *http.ServeMux {
@@ -29,7 +32,36 @@ func New(d Deps) *http.ServeMux {
 	mux.HandleFunc("GET /tickets/{id}", d.handleGetTicket)
 	mux.HandleFunc("POST /transactions", d.handleSubmitTransaction)
 	mux.HandleFunc("GET /outbox/stats", d.handleOutboxStats)
+	mux.HandleFunc("POST /webhook/payment", d.handlePaymentWebhook)
 	return mux
+}
+
+func (d Deps) handlePaymentWebhook(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "gagal membaca body"})
+		return
+	}
+	var p webhook.Payment
+	if err := json.Unmarshal(raw, &p); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body bukan json valid"})
+		return
+	}
+
+	inserted, err := d.Webhook.Store(r.Context(), p, raw)
+	switch {
+	case errors.Is(err, webhook.ErrPaymentIDKosong):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "payment_id wajib diisi"})
+	case err != nil:
+		log.Printf("webhook payment: %v", err)
+		// 500 -> pihak ketiga akan retry; aman karena penyimpanan idempoten
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+	case inserted:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "stored"})
+	default:
+		// duplikat tetap 200 - kalau dibalas error, pihak ketiga retry terus
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "duplicate": true})
+	}
 }
 
 func (d Deps) handleOutboxStats(w http.ResponseWriter, r *http.Request) {
