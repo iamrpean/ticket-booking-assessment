@@ -11,7 +11,7 @@
 ## Cara menjalankan
 
 ```
-docker compose up --build
+docker compose up -d --build
 ```
 
 - `:8080` - API utama
