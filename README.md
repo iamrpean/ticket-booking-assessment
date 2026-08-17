@@ -17,7 +17,7 @@ docker compose up --build
 - `:8080` - API utama
 - `:9090` - mock accounting(pihak ketiga)
 
-Jika port default bentrok, override lewat env: `PORT=8096 MOCK_PORT=9096 DB_PORT=5434 docker compose up`.
+Jika port default bentrok, override lewat env: `PORT=8096 MOCK_PORT=9096 DB_PORT=5434 docker compose up`. Daftar lengkap variabel ada di `.env.example` (salin jadi `.env`, docker compose membacanya otomatis).
 
 Bisa juga jalan tanpa container untuk development: `docker compose up -d db` lalu `go run ./cmd/server` (koneksi diatur env `DATABASE_URL`, defaultnya:`localhost:5432`). Env lain: `ACCOUNTING_URL` (default menunjuk ke mock). Saat start, tiket `vip-1` di-seed dengan stok 1 sesuai skenario.
 
@@ -67,12 +67,12 @@ curl -s localhost:8080/tickets/vip-1   # stok akhir: 0
 
 **Analisis:**
 Ada 2 masalah umum:
-1. Commit database setiap request → terlalu banyak proses commit/fsync, sehingga database cepat menjadi bottleneck dan throughput rendah.
-2. Langsung masukkan ke queue lalu balas sukses → memang lebih cepat, tapi berisiko kehilangan data jika server mati sebelum data benar-benar tersimpan.
+1. Commit database setiap request -> terlalu banyak proses commit/fsync, sehingga database cepat menjadi bottleneck dan throughput rendah.
+2. Langsung masukkan ke queue lalu balas sukses -> memang lebih cepat, tapi berisiko kehilangan data jika server mati sebelum data benar-benar tersimpan.
 
 **Solusi.** Antrian bounded + satu worker yang menulis secara batch, dengan aturan ketat: **response sukses baru dikirim setelah batch berisi transaksi itu ter-commit**.
 
-- Request masuk → masuk ke antrian, lalu request menunggu sampai datanya benar-benar tersimpan di database.
+- Request masuk -> masuk ke antrian, lalu request menunggu sampai datanya benar-benar tersimpan di database.
 - Worker mengumpulkan transaksi hingga 200 transaksi atau 20ms, lalu menyimpannya sekaligus dalam 1 transaksi database. Jadi banyak insert hanya membutuhkan 1 kali fsync/commit.
 - Jika antrian penuh, request akan menunggu sampai ada kapasitas. Data tidak langsung ditolak atau hilang.
 - Saat server dimatikan, server berhenti menerima request baru, lalu menyelesaikan semua transaksi yang masih ada di antrian sebelum benar-benar shutdown.
@@ -115,16 +115,19 @@ curl -s -X POST localhost:8080/transactions -d '{"ticket_id":"vip-1","user_id":"
 Setiap transaksi yang berhasil harus dikirim ke accounting software pihak ketiga. Namun, pihak ketiga bisa error (500), timeout, atau tidak bisa diakses.
 
 **Solusi: transactional outbox.** Saat transaksi disimpan ke database, sistem juga menyimpan tugas pengiriman ke accounting di tabel outbox dalam transaksi yang sama.
+```
 Transaksi berhasil
-      ↓
+      |
+      v
 Database
- ├── Data transaksi
- └── Outbox: PENDING
+ |-- Data transaksi
+ `-- Outbox: PENDING
+```
 
 Keduanya sama-sama tersimpan atau sama-sama gagal, sehingga tidak ada transaksi yang tersimpan tanpa tugas pengiriman.
 Kemudian dispatcher mengambil data PENDING dan mengirimkannya ke accounting:
-1. Gagal / timeout → retry otomatis dengan jeda bertahap: 1s → 2s → 4s → ... → 30s.
-2. Gagal 8 kali → status menjadi DEAD dan berhenti retry otomatis untuk ditangani manual.
+1. Gagal / timeout -> retry otomatis dengan jeda bertahap: 1s -> 2s -> 4s -> ... -> 30s.
+2. Gagal 8 kali -> status menjadi DEAD dan berhenti retry otomatis untuk ditangani manual.
 3. Setiap retry menggunakan X-Idempotency-Key yang sama, sehingga jika request sebenarnya sudah diterima accounting tetapi responsnya hilang, retry tidak membuat transaksi tercatat dua kali.
 
 **Asumsi:** 
@@ -173,8 +176,8 @@ curl -s localhost:9090/stats            # {"received":1} - diterima tepat sekali
 
 **Solusi.** Database memastikan payment_id hanya bisa tersimpan satu kali dengan UNIQUE(payment_id) + ON CONFLICT DO NOTHING.
 Alurnya:
-1. Request pertama → payment berhasil disimpan → balas 200 {"status":"stored"}.
-2. Request duplikat, termasuk yang datang bersamaan → tidak disimpan lagi → tetap balas 200 {"duplicate":true}.
+1. Request pertama -> payment berhasil disimpan -> balas 200 {"status":"stored"}.
+2. Request duplikat, termasuk yang datang bersamaan -> tidak disimpan lagi -> tetap balas 200 {"duplicate":true}.
 3. Duplikat tetap dibalas 200, bukan error. Karena bagi pihak ketiga, data tersebut sebenarnya sudah berhasil tersimpan. Kalau dibalas error, mereka akan menganggap gagal dan terus melakukan retry.
 
 **Asumsi.** 
@@ -213,13 +216,13 @@ curl -s -X POST localhost:8080/webhook/payment -d "$BODY"   # {"duplicate":true,
 **Masalah.**
 Sistem mengirim 2 update:
 ```
-Update 1 → quantity = 5
-Update 2 → quantity = 2
+Update 1 -> quantity = 5
+Update 2 -> quantity = 2
 ```
 Seharusnya kondisi akhirnya 2. Tetapi karena masalah jaringan, update 2 tiba lebih dulu:
 ```
-Update 2 → tiba dulu → quantity = 2
-Update 1 → tiba belakangan → quantity = 5
+Update 2 -> tiba dulu -> quantity = 2
+Update 1 -> tiba belakangan -> quantity = 5
 ```
 Akibatnya sistem tujuan menampilkan 5, padahal data terbaru sebenarnya 2.
 
@@ -227,17 +230,17 @@ Akibatnya sistem tujuan menampilkan 5, padahal data terbaru sebenarnya 2.
 
 **Contoh flow Alurnya**
 ```
-Update 1 → quantity=5, version=1
-Update 2 → quantity=2, version=2
+Update 1 -> quantity=5, version=1
+Update 2 -> quantity=2, version=2
 ```
 Jika version=2 datang lebih dulu:
 ```
-Simpan version=2 → quantity=2
+Simpan version=2 -> quantity=2
 ```
 Kemudian version=1 datang terlambat:
 ```
 version=1 < version=2
-→ diskip
+-> diskip
 ```
 
 contohnya script di bawah:
