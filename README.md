@@ -353,6 +353,7 @@ Test jalan melawan postgres sungguhan (bukan mock), jadi nyalakan database-nya d
 
 ```
 docker compose up -d db
+set -a; source .env; set +a #read env var
 go test -race ./...
 ```
 
